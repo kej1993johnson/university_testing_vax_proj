@@ -1,0 +1,257 @@
+---
+title: "UT_vaccine_coverage_estimates"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+```
+Load in county-level vaccine data 
+```{r}
+rm(list=ls())
+student_origin= read.csv('../data/student_geo_codes_2021_07_26.csv')
+#vacc_by_county = read.csv('../data/vaccine_coverage18to24_TX_6_21.csv')
+# Vaccine data
+vacc_by_age_county_tx = read.csv('../data/county_vaccinations_age_date_2021-07-26.csv') # texas
+vacc_by_county_US = read.csv('../data/COVID-19_Vaccinations_in_the_United_States_County.csv') # US
+
+# Zip to county from: https://simplemaps.com/data/us-zips
+zip_to_county<-read.csv('../data/uszips.csv')%>%
+  select(zip, county_fips, county_name)
+
+
+BINOM_SAMPS<-100
+```
+Summarise line-list student data into students per county
+```{r}
+
+
+# Assume that if student has permanent state in Texas, then TX vaccination/case data
+# is relevant. 
+student_origin_tx<-student_origin%>%filter(ORI_GEOG_CODE>0 & ORI_GEOG_CODE<300) # 40061 students have permanent in texas
+student_origin_tx['zip']<-as.numeric(gsub("(^\\d{5}).*", "\\1", student_origin_tx$PERM_ZIP))
+student_origin_tx<-student_origin_tx%>%mutate(county = ORI_GEOG_NAME)
+
+student_origin_not_tx<-student_origin%>%filter(ORI_GEOG_CODE>=300) 
+# US not TX
+student_origin_us<-student_origin_not_tx%>%filter(ORI_GEOG_CODE>=300 &ORI_GEOG_CODE<=370) #3878us not texas not foreign
+student_origin_us['zip']<-as.numeric(gsub("(^\\d{5}).*", "\\1", student_origin_us$PERM_ZIP))
+student_origin_us<-student_origin_us%>%left_join(zip_to_county, by = "zip")%>%
+  mutate(county = county_name,
+         county_fips = as.character(county_fips))
+
+
+# non-US
+student_origin_foreign<-student_origin_not_tx%>%filter(ORI_GEOG_CODE>=400)
+student_origin_foreign<-student_origin_foreign%>%mutate(county = "foreign", county_fips = NA)#1534 foreign
+
+# TX
+students_by_county_tx<-student_origin_tx%>%
+  group_by(county)%>%
+  summarise(n_students = n())
+#US not TX
+students_by_county_us<-student_origin_us%>%
+  group_by(county_fips)%>%
+  summarise(n_students = n())
+# foreign
+students_foreign<-student_origin_foreign%>%
+  group_by(county)%>%
+  summarise(n_students = n())
+
+```
+
+Filter the vaccination data sets to get most recent data and most relevant age 
+```{r}
+# TX county and proportions as of 7-26-2021
+vacc_by_county_tx<-vacc_by_age_county_tx%>%filter(date <= as.Date("2021-07-25"), 
+                                                  date >= as.Date("2021-06-25"),
+                                                  age_group == "16-49 years")%>%
+  mutate(prop_first_dose = one_dose/population,
+         prop_fully_vax = fully_vax/population)%>%
+  select(date, county, tsa_name, prop_first_dose, prop_fully_vax)
+# US counties county and proportions as of 7-25-2021
+vacc_by_county_US<-vacc_by_county_US%>%mutate(date = mdy(Date))%>%
+  filter(date <= as.Date("2021-07-25"), 
+         date >= as.Date("2021-06-25"))%>%
+  mutate(prop_first_dose =Administered_Dose1_Recip_18PlusPop_Pct/100,
+         prop_fully_vax = Series_Complete_18PlusPop_Pct/100,
+         county = Recip_County,
+         county_fips = as.character(FIPS),
+         state = Recip_State,
+         tsa_name = NA)%>%
+  arrange(date)%>%
+  filter(state!='TX')%>%
+  select(date, state, county, county_fips, tsa_name, prop_first_dose, prop_fully_vax)# use the 18+ percent? might be an overestimate 
+
+vacc_by_county_US$county<-gsub("County", "", as.character(vacc_by_county_US$county))
+```
+Use the vaccination data set timecourses to estimate prop_fully_vax_pred
+```{r}
+# First do this for TX data
+TX_counties<-vacc_by_county_tx$county%>%unique()
+for (i in 1:length(TX_counties)){
+  county_df<-vacc_by_county_tx%>%filter(county == TX_counties[i])
+  county_df$t<-yday(county_df$date)-yday(county_df$date[1])
+  county_df$t_pred<-seq(from = nrow(county_df), to = 2*nrow(county_df)-1, by = 1)
+  county_df$date_pred<-seq(from = as.Date("2021-07-26"), to = as.Date("2021-08-25"), by = 'days')
+  # Fit a linear model to t vs prop_fully_vacc
+  fit<-lm(prop_fully_vax ~t, data = county_df)
+  betas<-coefficients(fit)
+  county_df$fit<-betas[1] + betas[2]*county_df$t
+  county_df$prop_fully_vax_pred = betas[1] + betas[2]*county_df$t_pred
+  county_df$daily_rate_of_vax<-betas[2]
+  
+  if(i==1){
+    vacc_by_county_tx_t<-county_df
+  }
+  else{
+    vacc_by_county_tx_t<-rbind(vacc_by_county_tx_t, county_df)
+  }
+}
+vacc_by_county_tx_pred<-vacc_by_county_tx_t%>%filter(date == as.Date("2021-07-25"))
+
+
+test<-ggplot(data = county_df) + geom_point(aes(x = as.Date(date), y = prop_fully_vax)) + 
+  geom_line(aes(x = as.Date(date), y = fit))+
+  geom_line(aes(x = as.Date(date_pred), y = prop_fully_vax_pred), color = "red") + xlab('Date') +
+  ylab('Proportion fully vaccinated') + ggtitle(paste(as.character(county_df$county), 'COUNTY'))
+test
+
+all_counties_tx<-ggplot(data = vacc_by_county_tx_t) + geom_point(aes(x = as.Date(date), y = prop_fully_vax, group = county, color= county)) + 
+  geom_line(aes(x = as.Date(date), y = fit, group = county, color = county))+
+  geom_line(aes(x = as.Date(date_pred), y = prop_fully_vax_pred, group = county, color = county), linetype = "dashed") + xlab('Date') + theme(legend.position = "none")+
+  ylab('Proportion fully vaccinated') + ggtitle('Projected rates by county in TX')
+all_counties_tx
+```
+```{r}
+# Now do this for the US
+US_counties<-vacc_by_county_US$county_fips%>%unique()
+for (i in 1:length(US_counties)){
+  county_df<-vacc_by_county_US%>%filter(county_fips == US_counties[i])
+  county_df$t<-yday(county_df$date)-yday(as.Date("2021-06-25")) # in case not all dates available
+  # Fit a linear model to t vs prop_fully_vacc
+  fit<-lm(prop_fully_vax ~t, data = county_df)
+  betas<-coefficients(fit)
+  county_df$fit<-betas[1] + betas[2]*county_df$t
+  
+  # Make a new future df
+  date_pred<- seq(from = as.Date("2021-07-26"), to = as.Date("2021-08-25"), by = 'days')
+  t_pred<-yday(date_pred)-yday(as.Date("2021-06-25"))
+  prop_fully_vax_pred <- betas[1] + betas[2]*t_pred
+  prop_fully_vax_pred[prop_fully_vax_pred>1]<-1 # set max to 1
+  county_df_pred<-data.frame(date_pred, t_pred, prop_fully_vax_pred)
+  county_df_pred$county_fips<-rep(US_counties[i],)
+  county_df_pred$county<-rep(county_df$county[1],)
+  
+  if(i==1){
+    vacc_by_county_us_t_fit<-county_df
+    vacc_by_county_us_t_pred<-county_df_pred
+  }
+  else{
+    vacc_by_county_us_t_fit<-rbind(vacc_by_county_us_t_fit, county_df)
+    vacc_by_county_us_t_pred<-rbind(vacc_by_county_us_t_pred, county_df_pred)
+  }
+}
+```
+```{r}
+vacc_by_county_us_curr<-vacc_by_county_us_t_fit%>%filter(date == as.Date("2021-07-25"))
+vacc_by_county_us_pred<-vacc_by_county_us_t_pred%>%filter(date_pred == as.Date("2021-08-25"))
+max_fully_vax<-which.max(vacc_by_county_us_curr$prop_fully_vax)
+max_county<-vacc_by_county_us_curr[max_fully_vax,]
+
+test<-ggplot() + geom_point(data = county_df, aes(x = as.Date(date), y = prop_fully_vax)) + 
+  geom_line(data = county_df, aes(x = as.Date(date), y = fit))+
+  geom_line(data = county_df_pred, aes(x = as.Date(date_pred), y = prop_fully_vax_pred), color = "red") + xlab('Date') +
+  ylab('Proportion fully vaccinated') + ggtitle(paste(as.character(county_df$county)))
+test
+
+
+vacc_by_county_us_t_pred_small<-vacc_by_county_us_t_pred[1:1000, ]
+
+all_counties<-ggplot() + geom_line(data = vacc_by_county_us_t_pred, aes(x = as.Date(date_pred), y = prop_fully_vax_pred, group = county_fips, color= county), linetype = "dashed") + geom_line(data = vacc_by_county_us_t_fit, aes(x = as.Date(date), y = fit, group = county_fips, color = county))+
+  geom_point(data = vacc_by_county_us_t_fit, aes(x = as.Date(date), y = prop_fully_vax, group = county_fips, color = county))+ xlab('Date') + theme(legend.position = "none")+
+  ylab('Proportion fully vaccinated') + ggtitle('Projected rates by county in US')
+all_counties
+
+# Confirm that no counties where students are coming from have estimates that would be above 1
+false_ones_us<-vacc_by_county_us_curr%>%filter(prop_fully_vax ==1)
+false_ones_us<-false_ones_us%>%inner_join(students_by_county_us, by = "county_fips")%>%distinct()
+``` 
+
+
+
+
+```{r}
+# Check for missing data 
+false_zeros_tx<-vacc_by_county_tx_pred%>%filter(prop_fully_vax_pred ==0)
+false_zeros_US<-vacc_by_county_us_pred%>%filter(prop_fully_vax_pred ==0)
+false_zeros_US<-false_zeros_US%>%inner_join(students_by_county_us, by = "county_fips")%>%distinct()
+# 10 students from places with erroneous 0s. We will exclude these from the prevalence estimate. 
+exclude_fips<-false_zeros_US$county_fips
+students_by_county_us<-students_by_county_us%>%filter(county_fips!= exclude_fips)
+```
+
+
+
+
+Combine vaccination data and number of students per county data
+```{r}
+
+# Join with the vaccination data by county or county ID in the non-TX US
+# TX
+student_vacc_tx<-vacc_by_county_tx_pred%>%left_join(students_by_county_tx, by = "county")
+student_vacc_tx_counties<-student_vacc_tx
+student_vacc_tx<-student_vacc_tx%>%select(n_students, prop_fully_vax_pred)
+# US not TX
+student_vacc_us<-students_by_county_us%>%left_join(vacc_by_county_us_pred, by = "county_fips")
+# Assume the unknown counties are Travis ? Or can also use the nationwide average
+#ATX_first_dose_val<-vacc_by_county_tx$prop_first_dose[vacc_by_county_tx$county=="TRAVIS"]
+ATX_fully_vax_val<-vacc_by_county_tx_pred$prop_fully_vax_pred[vacc_by_county_tx_pred$county=="TRAVIS"]
+#student_vacc_us$prop_first_dose[is.na(student_vacc_us$prop_first_dose)] <-ATX_first_dose_val
+student_vacc_us$prop_fully_vax_pred[is.na(student_vacc_us$prop_fully_vax_pred)] <-ATX_fully_vax_val
+student_vacc_us<-student_vacc_us%>%select(n_students, prop_fully_vax_pred)
+student_vacc_foreign<-students_foreign%>%mutate(prop_fully_vax_pred= ATX_fully_vax_val)%>%
+        select(n_students, prop_fully_vax_pred)
+
+
+student_vacc<-rbind(student_vacc_tx, student_vacc_us)
+student_vacc<-rbind(student_vacc, student_vacc_foreign)
+student_vacc<-student_vacc%>%drop_na(n_students)
+
+```
+Use students per county and vaccination rate in county to estimate overall vaccination rate. 
+```{r}
+#vacc_first_dose_mat<-matrix(nrow = nrow(student_vacc), ncol = BINOM_SAMPS)
+vacc_full_mat<-matrix(nrow = nrow(student_vacc), ncol = BINOM_SAMPS)
+
+for (j in 1:nrow(student_vacc)){
+    # sample the number of vaccinated students from that county:
+    #vacc_first_dose_mat[j,]<-rbinom(BINOM_SAMPS,size = student_vacc$n_students[j], prob = student_vacc$prop_first_dose[j])
+    vacc_full_mat[j,]<-rbinom(BINOM_SAMPS,size = student_vacc$n_students[j], prob = student_vacc$prop_fully_vax_pred[j])
+}
+
+total_students<-sum(student_vacc$n_students)
+#first_dose_distrib<-colSums(vacc_first_dose_mat, na.rm = TRUE)
+fully_vacc_distrib<-colSums(vacc_full_mat, na.rm = TRUE)
+#first_dose_CI<-first_dose_distrib%>%quantile(probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+#pct_first_dose_CI<-100*first_dose_CI/total_students
+fully_vacc_CI<-fully_vacc_distrib%>%quantile(probs = c(0.025, 0.5, 0.975), na.rm = TRUE)
+pct_fully_vacc_CI<-100*fully_vacc_CI/total_students
+print(pct_fully_vacc_CI)
+#print(pct_first_dose_CI)
+
+age_odds = 28.4/35.5 #https://www.cdc.gov/mmwr/volumes/70/wr/mm7025e2.htm
+college_education_odds = 86/76.4 #https://covid19pulse.usc.edu/
+pct_fully_vacc_median = pct_fully_vacc_CI[2]
+pct_fully_vacc_lb = pct_fully_vacc_CI[2]*age_odds
+pct_fully_vacc_ub = pct_fully_vacc_CI[2]*college_education_odds
+
+pct_fully_vacc_range<-c(pct_fully_vacc_lb, pct_fully_vacc_median, pct_fully_vacc_ub)
+print(pct_fully_vacc_range)
+
+student_vacc<-student_vacc[with(student_vacc, order(-n_students)),]
+# Add Labels to these counties
+
+```

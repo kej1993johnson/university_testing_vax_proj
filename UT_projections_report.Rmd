@@ -1,0 +1,497 @@
+---
+title: "UT_projections_report"
+output: html_document
+---
+
+This script runs the testing cost effectiveness transmission functions and outputs results in terms of vaccination rates and testing frequency. 
+```{r setup, include=FALSE}
+rm(list=ls())
+library(ggplot2)
+library(deSolve)
+library(scales)
+library(dplyr)
+library(EpiEstim)
+library(tidyr)
+library(reshape2)
+library(cowplot)
+library(knitr)
+library(forcats)
+library(bigsnpr)
+library(EnvStats)
+library(tidyverse)
+library(ggpubr)
+library(zoo)
+source("testing_cost_effectiveness_fxns.R")
+theme_set(theme_cowplot())
+ggplot + background_grid(major = "xy", minor = "xy")
+PAR_TABLE_PATH<-'../data/par_table.csv'
+COST_TABLE_PATH<-'../data/cost_table.csv'
+PAR_BOUNDS_PATH<-'../data/par_bounds.csv'
+```
+Set parameters of model
+```{r}
+# vaccine and immunity parameters 
+e_v = 0.5 
+sigma_v = 0.36 # https://www.gov.il/en/departments/news/06072021-04
+sym_red = 0.3
+psym_v = sym_red/sigma_v
+
+# test parameters
+Sp = 0.995 # test specificity
+Se = 0.9 # test sensitivity
+w_v = 0.5 # proportion of vaccinated population willing to test
+w_u = 0.5 # proportion of unvaccinated population willing to test
+f_v = 0#1/30 # frequency of testing in vaccinated individuals
+f_u =1/7 # frequency of testing in unvaccinated individuals
+is = 0.925 # probability of isolating given a positive test 
+is_sym = 0.25 # probability of isolating given symptoms
+k = 1/2 # rate of confirmation testing
+r_r = 1/7 # rate of leaving quarantine asymptomatic or symptomatic quarantine states
+
+# epidemiological parameters
+R0 = 5
+t_exposed = 3
+t_pre_sym = 2.3
+t_inf = 7
+t_sym_state = t_inf-t_pre_sym
+t_quarantine = 7
+t_iso = 2 # time to isolate if symptomatic
+psym = 0.6
+intros_per_week = 5 # something arbitrary for now, lets say 5 infections per week
+avg_time_asym = psym*t_pre_sym + (1-psym)*t_inf
+avg_time_asym_v= psym_v*t_pre_sym + (1-psym_v)*t_inf
+# sanity checks (these don't go into par table)
+delta_au = 1/avg_time_asym
+delta_av = 1/avg_time_asym_v
+delta_s = 1/t_sym_state
+delta_q = 1/t_quarantine
+beta_a = R0*1/t_inf #transmission rate of asymptomatic individuals
+beta_s = R0*1/t_inf # transmission rate of symptomatic individuals 
+
+gamma = 1/3 # rate of transition from exposed to infectious
+init_prev = 420/100000 # initial disease prevalence on campus (0.2%) 9x7*3=189 per 100,000
+init_rec = 0.40
+init_vacc = 0.5
+odds_inf_not_vac = 1
+init_ru = init_rec- init_rec*init_vacc
+init_rv = init_rec*init_vacc
+init_sv = (1-init_rec)*init_vacc 
+#init_ru = 0.1 # initial recovered unvaccinated
+#init_rv = 0.2 # initial vaccinated and previously infected
+#init_sv = 0.3 # initial vaccinated susceptible
+
+# scenario parameters
+N<- 50000
+duration_school_year = 113
+tdays<-seq(from = 0, to = duration_school_year, by = 1)
+dates<-seq(from = as.Date("2021-08-25"), by = "day", length.out = duration_school_year+1)
+
+# cost parameters
+PCR_price = 23
+RT_price = 6.25
+online_price = 100000
+pct_pos_isofac = 2229/3271 # number of student-days in ISOFAC/ number of total positives during that time
+isofac_price = 300 #  $100 dollars per student per day
+contact_tracing_price = 50 # cost of labor to reach out to each cases contacts
+sequencing_price = 60 # need to factor this in
+n_rapid_tests_per_kiosk_per_week = 1375#250-300 per site per day *5 = 1250-1500 
+price_per_kiosk = 125000 #(50k for 3 kiosks + static SSB site = 50k/4)
+DLL_price = 500*15/135#500 per credit * 18 credits per semester/ 135 days per semester
+risk_tolerance = 'CDC yellow' 
+risk_tolerance = 'CDC orange'
+
+# Uncertainty
+R0vals<-c(4.5, 5.5)
+init_rec_vals<-c(0.32, 0.48)
+psym_vals<-c(0.5, 0.7)
+sigma_v_vals<-c(0.25, 0.5) # not sure how to estimate this
+sym_red_vals<-c(0.27, 0.35)
+is_vals<-c(0.9, 0.95)
+is_sym_vals<-c(0.2, 0.33)
+intro_vals<-c(4, 6)
+init_prev_vals<-c(380/100000, 470/100000)
+
+
+
+cost_table<-data.frame(PCR_price, RT_price, online_price, DLL_price, pct_pos_isofac,
+                       isofac_price, n_rapid_tests_per_kiosk_per_week, price_per_kiosk,
+                       contact_tracing_price, sequencing_price) 
+
+par_table<-data.frame(N, init_prev, init_rec, init_vacc, odds_inf_not_vac, duration_school_year, R0,
+                      t_pre_sym,
+                      t_inf, t_sym_state, t_quarantine,t_iso,  psym, gamma,psym, e_v, sigma_v,
+                      sym_red,intros_per_week,
+                      Sp, Se, w_v, w_u, f_v,f_u, is,is_sym, k)
+par_bounds<-data.frame(R0vals,init_rec_vals, psym_vals, sigma_v_vals, sym_red_vals, is_sym_vals, is_vals, intro_vals, init_prev_vals)
+write.csv(cost_table, '../data/cost_table.csv',row.names = FALSE)
+write.csv(par_table,'../data/par_table.csv', row.names = FALSE)
+write.csv(par_bounds, '../data/par_bounds.csv', row.names = FALSE)
+```
+
+Test to make sure the model with uncertainty runs properly
+```{r}
+par_table$f_u<-2/7
+par_table$init_vacc<-0.7
+out_list_uq<-testing_model_w_uncertainty(par_table, cost_table, risk_tolerance, nsamps, par_bounds)
+aggr_df_t<-out_list_uq[[4]]
+aggr_df<-out_list_uq[[3]]
+df_t_sims<-out_list_uq[[2]]
+
+par_table$f_u<-0
+par_table$f_v<-0
+out_nt_df<-solve_transmission_eqns(par_table)
+out_list_uq_nt<-testing_model_w_uncertainty(par_table, cost_table, risk_tolerance, nsamps, par_bounds)
+aggr_df_t_nt<-out_list_uq_nt[[4]]
+df_t_sims_nt<-out_list_uq_nt[[2]]
+
+Iplot<-ggplot() + geom_line(data = df_t_sims , aes(x = dates, y = I, group = sample), color = "blue", alpha = 0.1) + geom_line(data = aggr_df_t , aes(x = dates, y = I_med), color = "blue")  + geom_line(data = df_t_sims_nt, aes(x = dates, y = I, group = sample), color = "red", alpha = 0.1) + geom_line(data = aggr_df_t_nt, aes (x = dates, y = I_med), color = "red") +  scale_x_date(labels = date_format("%b"), breaks = date_breaks("month")) + xlab('Date') + ylab ('Infections')
+Iplot
+
+Isymdetplot<-ggplot() + geom_line(data = df_t_sims , aes(x = dates, y = Isymdet, group = sample), color = "blue", alpha = 0.1) + 
+  geom_line(data = aggr_df_t , aes(x = dates, y = Isymdet_med), color = "blue")  +
+  geom_line(data = df_t_sims_nt, aes(x = dates, y = Isymdet, group = sample), color = "black", alpha = 0.1) + 
+  geom_line(data = aggr_df_t_nt, aes (x = dates, y = Isymdet_med), color = "black") +
+  geom_hline(yintercept = N*50/100000, linetype = "dashed", color = "orange") +
+  geom_hline(yintercept = N*10/100000, linetype = "dashed", color = "yellow") +
+  geom_hline(yintercept = N*100/100000, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = N*42/30000, linetype = "dashed", color = "purple") +  scale_x_date(labels = date_format("%b"), breaks = date_breaks("month")) + xlab('Date') + ylab ('Symptomatic detected infections') + coord_cartesian(ylim = c(0,75))
+Isymdetplot
+```
+Vary vaccine coverage, and within each vaccine coverage, simulate different testing frequencies for unvaccinated population. For each vaccine coverage and potentially disease prevalence, find the minimal amount of testing that prevents the university from having to move classes online.
+```{r}
+# Scenario 1: immunity long-lasting, vaccines remain effective, no major variants
+cost_table<-read.csv(COST_TABLE_PATH)
+par_table<-read.csv(PAR_TABLE_PATH)
+par_table$R0 = 5
+par_bounds$R0vals = c(4.5, 5.5)
+nsamps<-10# for now set to 10 ( make this 100 for final results)
+par_table$w_u<-0.5 # assume 50% of unvaccinated are willing to participate
+par_table$f_v<-0 # assume vaccinated don't have to be tested at all
+risk_tolerance = 'UT Jan 2021'
+vacc_coverage<-seq(from = 0.4, to = 0.8, by = 0.1)
+#vacc_coverage<-seq(from = 0.45, to = 0.7, by = 0.05)
+#vacc_coverage<-seq(from = 0.5, to = 0.7, by = 0.1)
+test_freqs<-c(0, 1/30, 1/14, 1/7, 2/7, 3/7, 1)
+test_policies<-c('symptomatic only', 'every month', 'every 2 weeks', 'weekly', '2 times per week', '3 times per week', 'daily')
+vacc_policy<-c('40% vaccinated', '50% vaccinated', '60% vaccinated', '70% vaccinated', '80% vaccinated')
+pct_per_week_uv_tested<-test_freqs*7*par_table$w_u
+N<-par_table$N
+#n_tests_per_week_uv<-(1-vacc_coverage)*par_table$N*pct_per_week_uv_tested
+
+# if Scenario 2: immunity from infection wanes, vaccines have reduced efficacy, and new variant is more transmissible
+#par_table$e_v<-0.75
+#par_table$sigma_v<-0.5
+#par_table$alpha_i<-1/180
+#par_table$R0 <- 5
+#par_table$f_v<-1/7
+if (risk_tolerance =='CDC yellow' ){
+    close_thres = 10/100000
+  }
+  if (risk_tolerance == 'CDC orange'){
+    close_thres = 50/100000
+  }
+  if (risk_tolerance == 'CDC red'){
+    close_thres = 100/100000
+  }
+  if (risk_tolerance == 'UT Jan 2021'){
+    close_thres = (20 + 0.7*32)/30000 # week ending on 1/16 --> forced school remote in Jan
+  }
+tdays<-seq(from = 0, to = par_table$duration_school_year)
+dates<-seq(from = as.Date("2021-08-20"), by = "day", length.out = par_table$duration_school_year+1)
+for(j in 1:length(vacc_coverage)){
+    pct_vacc<-vacc_coverage[j]
+    par_table$init_vacc<-vacc_coverage[j]
+    vacc_cov<-rep(vacc_coverage[j], par_table$duration_school_year+1)
+    vacc_policies<-rep(vacc_policy[j], par_table$duration_school_year+1)
+    vacc_rate<-vacc_policy[j]
+    for (k in 1:length(test_freqs)){
+      testing_freq<-test_freqs[k]
+      testing_policy<-test_policies[k]
+      par_table$f_u<-test_freqs[k]
+      test_freq<-rep(test_freqs[k], par_table$duration_school_year+1)
+      test_policy<-rep(test_policies[k], par_table$duration_school_year+1)
+      testing_policy<-test_policies[k]
+      #out_df<-solve_transmission_eqns(par_table)
+      #summary_df<-testing_model(par_table, cost_table, risk_tolerance)
+      # Get the outputs from each sample and the aggregate outputs over time and in summary
+      out_list_uq<-testing_model_w_uncertainty(par_table, cost_table, risk_tolerance,
+                                               nsamps, par_bounds)
+      df_sim<-out_list_uq[[1]] # contains final results for all nsims
+      df_t_sim<-out_list_uq[[2]] # contains time course of results for all nsims
+      aggr_df<-out_list_uq[[3]] # contains lb, ub, median of final results 
+      aggr_df<-cbind(aggr_df,testing_policy, vacc_rate)
+      aggr_df_t<-out_list_uq[[4]] # contains time course of lb, ub, median of results
+      aggr_df_t<-cbind(aggr_df_t, test_policy, vacc_policies)
+      # check if Isymdet is above each threshold
+      above_yellow<-any(aggr_df_t$Isymdet_ub>N*10/100000)
+      above_orange<-any(aggr_df_t$Isymdet_ub>N*50/100000)
+      above_red<-any(aggr_df_t$Isymdet_ub>N*100/100000)
+      above_UT_Jan<-any(aggr_df_t$Isymdet_ub>N*(20 + 0.7*32)/30000)
+      # add column indicating whether that testing freq/vaccine coverage combo has an
+      # upper bound above the threshold. 
+      aggr_df<-cbind(aggr_df, above_yellow, above_orange, above_red, above_UT_Jan)
+    
+      
+      if(k ==1 & j==1){
+        df<-df_sim
+        df_t<-df_t_sim
+        df_uq<-aggr_df
+        df_t_uq<-aggr_df_t
+    
+      }
+      else{
+        df<-rbind(df, df_sim)
+        df_t<-rbind(df_t, df_t_sim)
+        df_uq<-rbind(df_uq, aggr_df)
+        df_t_uq<-rbind(df_t_uq, aggr_df_t)
+      }
+      
+    }
+  }
+
+```
+For each vaccine coverage, find the minimum testing needed at each risk tolerance level
+```{r}
+threshold_prob = 0.05
+df_small<-df_uq%>%select(pct_vacc_med, testing_freq_med, days_of_online_med, days_of_online_ub,
+                         cross_orange_prob, cross_red_prob, cross_UTJan_prob)
+df_min<-get_min_testing_per_vacc(df_uq,threshold_prob, vacc_coverage)
+df_min$testing_policy<-factor(df_min$testing_policy, ordered = TRUE,
+                         stringr::str_wrap(c("symptomatic only", "every month", "every 2 weeks", "weekly", "2 times per week", "3 times per week", "daily")))
+                           
+                           #"symptomatic only","every month", 
+                                       #"every 2 weeks", "weekly", "2 times per week", "3 times per week", #"daily")))
+write.csv(df_uq,'../out/summary_results.csv',row.names = FALSE )
+write.csv(df_t_uq, '../out/results_t.csv', row.names = FALSE)
+write.csv(df_min, '../out/min_testing.csv', row.names = FALSE)
+```
+Load in the data frames if don't want to rerun, make smaller dataframe for the main tables
+
+```{r}
+close_thres = (20 + 0.7*32)/30000
+df_uq<-read.csv('../out/summary_results.csv')
+df_t_uq<-read.csv('../out/results_t.csv')
+df_min<-read.csv('../out/min_testing.csv')
+df_print<-df_uq%>%select(pct_vacc_med,testing_policy, n_inf_med, n_inf_lb, n_inf_ub, max_symdet_med, max_symdet_lb, max_symdet_ub)
+
+df_t_uq$test_policy<-factor(df_t_uq$test_policy, ordered = TRUE,
+                         stringr::str_wrap(c("daily", "3 times per week",
+                                             "2 times per week", 
+                                       "weekly", "every 2 weeks", "every month", 
+                                       "symptomatic only")))
+
+path = "../out/sym_det_t_all.png"
+# First plot testing needed
+thres_sym_det<-ggplot(df_t_uq) + geom_line(aes(x = as.Date(dates), y = Isymdet_med, group = factor(test_policy), color = factor(test_policy))) + geom_ribbon(aes(x = as.Date(dates), ymin = Isymdet_lb, ymax = Isymdet_ub, group = factor(test_policy), fill = factor(test_policy)), alpha = 0.1)+ geom_hline(yintercept = N*100/100000, color = "gray")+ facet_grid(~vacc_policies)+geom_hline(yintercept = N*(20 + 0.7*32)/30000, color = "gray48") + labs(color = "Test frequency") + xlab('Date') + ylab('Symptomatic Detected Cases')  + scale_color_brewer(palette = "Set2", direction = -1) +scale_fill_brewer(palette = "Set2", direction = -1) + coord_cartesian(ylim = c(0,6*N*close_thres )) +
+  theme(axis.text.x = element_text(angle=45, hjust = 1)) + theme(legend.position = "none", legend.text= element_text(size = 12)) +  scale_x_date(date_labels = "%b") + guides(fill = FALSE) 
+thres_sym_det
+ggsave(filename = path, device = "png", dpi = 700)
+
+path = "../out/sym_det_t.png"
+# First plot testing needed
+df_t_uq_sel<-df_t_uq%>%filter(pct_vacc_med ==0.6 | pct_vacc_med == 0.8)
+thres_sym_det_sel<-ggplot(df_t_uq_sel) + geom_line(aes(x = as.Date(dates), y = Isymdet_med, group = factor(test_policy), color = factor(test_policy))) + geom_ribbon(aes(x = as.Date(dates), ymin = Isymdet_lb, ymax = Isymdet_ub, group = factor(test_policy), fill = factor(test_policy)), alpha = 0.1)+ geom_hline(yintercept = N*100/100000, color = "gray", alpha = 0.5)+ facet_grid(~vacc_policies)+geom_hline(yintercept = N*(20 + 0.7*32)/30000, color = "gray48") + labs(color = "Test frequency") + xlab('Date') + ylab('Symptomatic Detected Cases')  + scale_color_brewer(palette = "Set2", direction = -1) +scale_fill_brewer(palette = "Set2", direction = -1) + coord_cartesian(ylim = c(0,2*N*close_thres )) +
+  theme(axis.text.x = element_text(angle=45, hjust = 1)) + theme(aspect.ratio = 1, legend.position = "right", legend.text= element_text(size = 11)) +  scale_x_date(date_labels = "%b") + guides(fill = FALSE) 
+thres_sym_det_sel
+ggsave(filename = path, device = "png", dpi = 700)
+```
+Plot and report the minimum amount of testing needed at each vaccination level and risk tolerance
+```{r}
+df_UTJan<-df_min%>%filter(thres == "UT Jan")
+path = '../out/test_freq.png'
+bar_test_freq<-ggplot(df_UTJan, aes(x = 100*pct_vacc_med, y = 7*testing_freq_med)) + geom_bar(stat = "identity", position = position_dodge())  + xlab('Percent vaccinated') + ylab('Recommended frequency (tests per week)') + guides(fill = FALSE)+theme(aspect.ratio = 1, axis.title.y = element_text(size =14))
+bar_test_freq
+ggsave(filename = path, device = "png", dpi = 700)
+path = '../out/tot_tests.png'
+bar_tot_tests<-ggplot(df_UTJan, aes(x = 100*pct_vacc_med, y = n_tests_per_week_med)) + geom_bar(stat = "identity", position = position_dodge()) + xlab('Percent vaccinated') + ylab('Total tests per week')+guides(fill = FALSE) + theme(aspect.ratio = 1)
+bar_tot_tests
+ggsave(filename = path, device = "png", dpi = 700)
+path = '../out/fig2.png'
+
+# Concise table for including in report
+df_table_tests<-df_UTJan%>%select(pct_vacc_med, n_tests_per_week_med, testing_policy)
+```
+Make cost breakdown figures for all levels of testing
+```{r}
+df_long<-df_uq%>%
+  dplyr::select(pct_vacc_med, vacc_rate, testing_freq_med, testing_policy, n_kiosks_med, 
+                              pct_inf_med, cost_PCR_med,
+                              cost_RT_med, cost_isofac_med, cost_sequencing_med, cost_kiosks_med,
+                              cost_contact_tracing_med, cost_of_online_med)%>%
+  pivot_longer(cols = starts_with("cost_"),names_to = "Source",names_prefix = "cost_", values_to = "cost" )%>%mutate(test_strategy = 'yes')
+df_long$testing_policy<-factor(df_long$testing_policy, ordered = TRUE,
+                         stringr::str_wrap(c("symptomatic only","every month", 
+                                       "every 2 weeks", "weekly", "2 times per week", "3 times per week",
+                                       "daily")))
+df_uq$testing_policy<-factor(df_uq$testing_policy, ordered = TRUE,
+                         stringr::str_wrap(c("symptomatic only","every month", 
+                                       "every 2 weeks", "weekly", "2 times per week", "3 times per week",
+                                       "daily")))
+
+
+df_long$Source<-factor(df_long$Source, ordered = TRUE,
+                         stringr::str_wrap(c("of_online_med", "contact_tracing_med",
+                                             "isofac_med", 
+                                       "kiosks_med", "PCR_med", "RT_med", 
+                                       "sequencing_med")))
+path = "../out/figA3_costs.png"
+bar_costs_comb<-ggplot(df_long, aes (x = testing_policy, y = cost/1e6, fill = factor(Source))) + geom_bar(stat = "identity", position = "stack") + facet_wrap(~vacc_rate, ncol = 6) +  scale_fill_brewer(palette = "Set1", direction = -1)+
+xlab('Test Frequency') + ylab('Cost to UT (millions)') +labs(fill = "Source of cost") + theme(legend.position = "none", legend.text = element_blank(), legend.title = element_blank(), axis.text.y = element_text(size = 8), axis.title = element_text(size = 12)) + theme(axis.text.x = element_text(angle=45, hjust = 1, size = 8), aspect.ratio =1.3) 
+bar_costs_comb
+ggsave(filename = path, device = "png", dpi = 700)
+
+
+path = "../out/figA3_inf.png"
+bar_inf<-ggplot(df_uq, aes(x = testing_policy, y = n_inf_med/1000)) + geom_bar(stat = "identity", position = "stack") + facet_wrap(~vacc_rate, ncol = 6) + geom_errorbar(aes(ymin = n_inf_lb/1000, ymax= n_inf_ub/1000), width = 0.1, position = position_dodge(0.04)) + xlab('Test frequency') + ylab('Infections (thousands)')  + theme(axis.text.x = element_blank(), axis.title.x = element_blank(), axis.title = element_text(size = 12), legend.position = "none", aspect.ratio =1.3)+ scale_fill_gradient(low = "blue", high = "red")
+bar_inf
+ggsave(filename = path, device = "png", dpi = 700)
+
+# Do only for 60% and 80% vaccination
+
+# Make the figure with only 50 and 80% vaccination 
+path = "../out/fig2a.png"
+df_long_sel<-df_long%>%filter(pct_vacc_med==0.6 | pct_vacc_med == 0.8)
+bar_costs_comb_sel<-ggplot(df_long_sel, aes (x = testing_policy, y = cost/1e6, fill = factor(Source))) + geom_bar(stat = "identity", position = "stack") + facet_wrap(~vacc_rate, ncol = 6) +  scale_fill_brewer(palette = "Set1", direction = -1) + xlab('Test Frequency') + ylab('Cost to UT (millions)') +labs(fill = "Source of cost") + theme(legend.position = "none", legend.text = element_blank(), legend.title = element_blank(), axis.text.y = element_text(size = 10), axis.title = element_text(size = 14)) + theme(axis.text.x = element_text(angle=45, hjust = 1, size = 11.5)) 
+bar_costs_comb_sel
+ggsave(filename = path, device = "png", dpi = 700)
+
+path = "../out/fig2b.png"
+df_uq_sel<-df_uq%>%filter(pct_vacc_med== 0.6 |pct_vacc_med == 0.8)
+bar_inf_sel<-ggplot(df_uq_sel, aes(x = testing_policy, y = n_inf_med/1000)) + geom_bar(stat = "identity", position = "stack") + facet_wrap(~vacc_rate, ncol = 6) + geom_errorbar(aes(ymin = n_inf_lb/1000, ymax= n_inf_ub/1000), width = 0.1, position = position_dodge(0.04))  + ylab('Infections (thousands)')  + theme(axis.text.x = element_blank(),axis.title = element_text(size = 14), legend.position = "none")+ scale_fill_gradient(low = "blue", high = "red")
+bar_inf_sel
+ggsave(filename = path, device = "png", dpi = 700)
+
+```
+Housing projections
+```{r}
+nsamps<-100
+cost_table<-read.csv(COST_TABLE_PATH)
+par_table<-read.csv(PAR_TABLE_PATH)
+par_bounds<-read.csv(PAR_BOUNDS_PATH)
+par_table$intros_per_week<-5
+par_bounds$intro_vals<-c(2, 8)
+par_table$init_rec<-0.35
+par_bounds$init_rec_vals<-c(0.27, 0.43) # using updated estimates
+par_table$N<-7400
+iso_prob<-0.8
+par_table$f_v<-0 # assume vaccinated don't have to be tested at all
+par_table$f_u<-0
+vacc_coverage<-seq(from = 0.4, to = 0.8, by = 0.1)
+
+
+tdays<-seq(from = 0, to = par_table$duration_school_year)
+dates<-seq(from = as.Date("2021-08-20"), by = "day", length.out = par_table$duration_school_year+1)
+for(j in 1:length(vacc_coverage)){
+    pct_vacc<-vacc_coverage[j]
+    par_table$init_vacc<-vacc_coverage[j]
+    vacc_cov<-rep(vacc_coverage[j], par_table$duration_school_year+1)
+    out_list_uq<-testing_model_w_uncertainty(par_table, cost_table, risk_tolerance, nsamps,
+                                             par_bounds)
+  aggr_df_t<-out_list_uq[[4]]
+  aggr_df<-out_list_uq[[3]]
+  df_t_sims<-out_list_uq[[2]]
+  df_sims<-out_list_uq[[1]]
+      # time dependent variables
+      # all those in aggr_df_t
+      isofac_t_med<-aggr_df_t$Isymdet_med*iso_prob
+      isofac_t_lb<-aggr_df_t$Isymdet_lb*iso_prob
+      isofac_t_ub<-aggr_df_t$Isymdet_ub*iso_prob
+      isofac_10d<-rollmean(isofac_t_med, k=7, fill =NA) # Find 10 day rolling average of isofac_t
+      # static variables
+      n_isofac_med<-iso_prob*aggr_df$n_pos_med
+      n_isofac_lb<-iso_prob*aggr_df$n_pos_lb
+      n_isofac_ub<-iso_prob*aggr_df$n_pos_ub
+      max_isofac_med<-max(isofac_t_med)
+      imed<-which.max(isofac_t_med)
+      date_max<-dates[imed]
+      max_isofac_lb<-max(isofac_t_lb)
+      max_isofac_ub<-max(isofac_t_ub)
+    if(j==1 ){
+        df_t<-cbind(aggr_df_t, vacc_cov, isofac_t_med, isofac_t_lb, isofac_t_ub,
+                    isofac_10d)
+        df<-cbind(aggr_df, n_isofac_med, n_isofac_lb, n_isofac_ub, max_isofac_med, 
+                  max_isofac_lb, max_isofac_ub,date_max, pct_vacc)
+      }
+      else{
+        df_ti<-cbind(aggr_df_t, vacc_cov, isofac_t_med, isofac_t_lb, isofac_t_ub,
+                     isofac_10d)
+        dfi<-cbind(aggr_df, n_isofac_med, n_isofac_lb, n_isofac_ub, max_isofac_med, 
+                  max_isofac_lb, max_isofac_ub, date_max, pct_vacc)
+        df_t<-rbind(df_t, df_ti)
+        df<-rbind(df, dfi)
+      }
+      
+}
+
+write.csv(df_t, '../out/df_t_housing.csv')
+write.csv(df, '../out/df_housing.csv')
+
+#df<-read.csv('../out/df_housing.csv')
+#df_t<-read.csv('../out/df_t_housing.csv')
+df_isofac_table<-df%>%select(pct_vacc_med, date_max, max_isofac_med, max_isofac_lb, max_isofac_ub, n_isofac_med, n_isofac_lb, n_isofac_ub, n_inf_med, n_inf_lb, n_inf_ub)
+path = "../out/isofac_t.png"
+# Plot isofac usage over time as a function of vaccine coverage
+isofac_use<-ggplot(df_t) + geom_line(aes(x = dates, y = isofac_t_med, 
+   color = factor(vacc_cov))) + geom_ribbon(aes(x = dates, ymin = isofac_t_lb, 
+  ymax = isofac_t_ub, fill = factor(vacc_cov)), alpha = 0.1) + 
+  xlab('Date') + ylab('Students in isolation facility')  + scale_color_brewer(palette = "Spectral", direction = -1) + scale_fill_brewer(palette = "Spectral", direction = -1)+theme(legend.position = "none") + guides(fill = FALSE)
+isofac_use
+ggsave(filename = path, device = "png", dpi = 700)
+
+path = "../out/isofac_max.png"
+isofac_max<-ggplot(df, aes(x = 100*pct_vacc, y = max_isofac_med, fill = factor(100*pct_vacc))) + 
+  geom_bar(stat = "identity")+geom_errorbar(aes(ymin = max_isofac_lb, ymax= max_isofac_ub), width = 0.01, position = position_dodge(0.04)) + scale_fill_brewer(palette = "Spectral", direction = -1) + xlab('Percent vaccinated') + ylab('Peak occupancy') +labs(fill = 'Percent vaccinated')
+isofac_max
+ggsave(filename = path, device = "png", dpi = 700)
+```
+
+Sensitivity analysis on the likelihood/overlap between unvaccinated and those previously infected
+```{r}
+cost_table<-read.csv(COST_TABLE_PATH)
+par_table<-read.csv(PAR_TABLE_PATH)
+par_bounds<-read.csv(PAR_BOUNDS_PATH)
+odds_inf_not_vac_vec<-seq(from = 0.5, to = 3, by = 0.5)
+pct_vacc_vec<-seq(from = 0.4, to = 0.8, by = 0.1)
+par_table$f_u<-0
+vacc_policy<-c('40% vaccinated', '50% vaccinated', '60% vaccinated', '70% vaccinated', '80% vaccinated')
+
+N<-par_table$N
+tdays<-seq(from = 0, to = par_table$duration_school_year)
+dates<-seq(from = as.Date("2021-08-20"), by = "day", length.out = par_table$duration_school_year+1)
+for(j in 1:length(pct_vacc_vec)){
+    par_table$init_vacc<-pct_vacc_vec[j]
+    vacc_policies<-rep(vacc_policy[j], par_table$duration_school_year+1)
+    for (k in 1:length(odds_inf_not_vac_vec)){
+      par_table$odds_inf_not_vac<-odds_inf_not_vac_vec[k]
+      odds_prev_inf<-rep(odds_inf_not_vac_vec[k],  par_table$duration_school_year +1)
+      out_list_uq<-testing_model_w_uncertainty(par_table, cost_table, risk_tolerance,
+                                               nsamps, par_bounds, vacc_inf_correlation = 'correlated')
+      df_sim<-out_list_uq[[1]]
+      df_t_sim<-out_list_uq[[2]]
+      aggr_df<-out_list_uq[[3]]
+      aggr_df_t<-out_list_uq[[4]]
+      aggr_df_t<-cbind(aggr_df_t, vacc_policies, odds_prev_inf)
+      if(k ==1 & j==1){
+        df<-df_sim
+        df_t<-df_t_sim
+        df_uq<-aggr_df
+        df_t_uq<-aggr_df_t
+    
+      }
+      else{
+        df<-rbind(df, df_sim)
+        df_t<-rbind(df_t, df_t_sim)
+        df_uq<-rbind(df_uq, aggr_df)
+        df_t_uq<-rbind(df_t_uq, aggr_df_t)
+      }
+      
+    }
+}
+
+N = 50000
+path = "../out/sens_analysis_vac_corr.png"
+# First plot testing needed
+sensitivity_to_vacc<-ggplot(df_t_uq) + geom_line(aes(x = as.Date(dates), y = Isymdet_med, group = factor(odds_prev_inf), color = factor(odds_prev_inf))) + geom_ribbon(aes(x = as.Date(dates), ymin = Isymdet_lb, ymax = Isymdet_ub, group = factor(odds_prev_inf), fill = factor(odds_prev_inf)), alpha = 0.1)+ geom_hline(yintercept = N*close_thres, color = "gray48") + geom_hline(yintercept = N*100/100000, color = "gray")+ facet_grid(~vacc_policies) + labs(color = "Odds previously infected in unvaccinated") + xlab('Date') + ylab('Symptomatic Detected Cases')  + scale_color_brewer(palette = "BrBG", direction = -1) +scale_fill_brewer(palette = "BrBG", direction = -1) + coord_cartesian(ylim = c(0,4*N*close_thres )) +
+  theme(axis.text.x = element_text(angle=45, hjust = 1)) + theme(legend.position = "bottom", legend.text= element_text(size = 12)) +  scale_x_date(date_labels = "%b") + guides(fill = FALSE) + labs(color = "Odds previously infected if unvaccinated")
+sensitivity_to_vacc
+ggsave(filename = path, device = "png", dpi = 700)

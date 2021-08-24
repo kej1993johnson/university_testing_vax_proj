@@ -1,0 +1,116 @@
+---
+title: "UT_case_introduction_estimates"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+```
+Load in county-level student registrar and case data
+
+```{r}
+rm(list=ls())
+student_origin= read.csv('../data/student_geo_codes_2021_07_26.csv')
+
+
+# Zip to county from: https://simplemaps.com/data/us-zips
+zip_to_county<-read.csv('../data/uszips.csv')%>%
+  select(zip, county_fips, county_name)
+# county population size
+county_pops<-read.csv('../data/county_pops.csv')
+
+
+# Case data
+cases_by_county<-read.csv(url("https://raw.githubusercontent.com/nytimes/covid-19-data/master/us-counties-recent.csv"))
+reporting_rate<- c(1/3.5, 1/3.9, 1/4.4) # https://www.cdc.gov/coronavirus/2019-ncov/cases-updates/burden.html
+
+date_of_pull<-as.Date("2021-08-12")
+
+N_students<-55000 # use student registrar
+N_facstaff<- 12830 + 3395 # staff + faculty (use Travis county)
+N_reshalls<-7400
+
+```
+Summarize line list student data into students per county in the US and foreign
+```{r}
+# us
+student_origin_us<-student_origin%>%filter(ORI_GEOG_CODE<=370) 
+student_origin_us['zip']<-as.numeric(gsub("(^\\d{5}).*", "\\1", student_origin_us$PERM_ZIP))
+student_origin_us<-student_origin_us%>%left_join(zip_to_county, by = "zip")%>%
+  mutate(county = county_name,
+         county_fips = as.character(county_fips))
+
+# non-US
+student_origin_foreign<-student_origin%>%filter(ORI_GEOG_CODE>=400)
+student_origin_foreign<-student_origin_foreign%>%mutate(county = "foreign", county_fips = NA)#1534 foreign
+
+
+#US
+students_by_county_us<-student_origin_us%>%
+  group_by(county_fips)%>%
+  summarise(n_students = n())
+# foreign
+students_foreign<-student_origin_foreign%>%
+  group_by(county_fips)%>%
+  summarise(n_students = n())
+```
+Filter the case data to get the prevalence in each county 
+```{r}
+
+county_cases<-cases_by_county%>%filter(date>=(date_of_pull-6) & date<=date_of_pull)%>%
+  mutate(county_fips = as.character(fips))%>%
+  group_by(county_fips, county, state)%>%
+  summarise(sum_cases_7_days = max(cases) - min(cases)) # difference in cumulative cases in 7 days
+county_cases['county_state_formatted']<-paste0(county_cases$county, ", ",county_cases$state)
+county_cases$county_fips[county_cases$county == "New York City"]<-36061
+# Join county population size to get prevalence
+county_pops$pop<-as.numeric(gsub(",", "", county_pops$pop))
+county_cases<-county_cases%>%left_join(county_pops, by = "county_state_formatted")%>%
+  mutate(cases_per_100k=((sum_cases_7_days/pop)/7)*100000,
+         seven_day_cases=((sum_cases_7_days/pop))*100000,
+         prev_lo = 1/reporting_rate[1]*sum_cases_7_days/pop*100000,
+         prev_med = 1/reporting_rate[2]*sum_cases_7_days/pop*100000,
+         prev_hi= 1/reporting_rate[3]*sum_cases_7_days/pop*100000)%>%
+         drop_na(county_fips)
+
+Travis_cases<-county_cases%>%filter(county_state_formatted== "Travis, Texas")
+
+
+
+student_cases<-students_by_county_us%>%left_join(county_cases, by = "county_fips")%>%distinct()%>%drop_na(county_fips)
+# add the row for foreign students
+student_cases_Travis<-student_cases%>%filter(county_state_formatted=="Travis, Texas")
+student_cases_foreign<-student_cases_Travis
+student_cases_foreign$n_students<-students_foreign$n_students
+student_cases_foreign$county<-'foreign'
+student_cases<-rbind(student_cases, student_cases_foreign)
+student_cases<-student_cases%>%mutate(inf_lo =n_students*prev_lo/100000,
+                                      inf_med = n_students*prev_med/100000,
+                                      inf_hi = n_students*prev_hi/100000)
+tot_students = sum(student_cases$n_students)
+prev_inf_lo = sum(student_cases$inf_lo/tot_students, na.rm = TRUE)
+prev_inf_med = sum(student_cases$inf_med/tot_students, na.rm = TRUE)
+prev_inf_hi = sum(student_cases$inf_hi/tot_students, na.rm = TRUE)
+
+prev_est<-c(prev_inf_lo, prev_inf_med, prev_inf_hi)
+print(prev_est)
+
+prev_est_Travis<-c(Travis_cases$prev_lo, Travis_cases$prev_med, Travis_cases$prev_hi)/100000
+print(prev_est_Travis)
+
+```
+What does this translate into in terms of number arriving infected
+```{r}
+inf_est_students<-(prev_est)*N_students
+inf_est_facstaff<-(prev_est_Travis)*N_facstaff
+inf_est_reshalls<-(prev_est)*N_reshalls
+
+print(c('Number of students arriving infected:', round(inf_est_students,1)))
+print(c('Number of faculty/staff arriving infected:', round(inf_est_facstaff,1)))
+print(c('Number of students in residence halls arriving infected:', round(inf_est_reshalls,1)))
+
+  
+
+```
